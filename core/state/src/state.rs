@@ -350,15 +350,42 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
     }
 
     fn withdrawable_staking_balance(
-        &self, _address: &Address, _current_block_number: u64,
+        &self, address: &Address, current_block_number: u64,
     ) -> Result<U256> {
-        unimplemented!()
+        let staking_balance =
+            self.staking_balance(address).unwrap_or(U256::zero());
+        let vote_stake_list =
+            self.get_vote_stake_list(address)?.as_ref().unwrap();
+        if vote_stake_list.is_empty() {
+            Ok(staking_balance)
+        } else {
+            // Find first index whose `unlock_block_number` is greater than
+            // timestamp and all entries before the index could be
+            // ignored.
+            let idx = vote_stake_list
+                .binary_search_by(|vote_info| {
+                    vote_info
+                        .unlock_block_number
+                        .cmp(&(current_block_number + 1))
+                })
+                .unwrap_or_else(|x| x);
+            if idx == vote_stake_list.len() {
+                Ok(staking_balance)
+            } else {
+                Ok(staking_balance - vote_stake_list[idx].amount)
+            }
+        }
     }
 
     fn locked_staking_balance_at_block_number(
-        &self, _address: &Address, _block_number: u64,
+        &self, address: &Address, block_number: u64,
     ) -> Result<U256> {
-        unimplemented!()
+        let staking_balance =
+            self.staking_balance(address).unwrap_or(U256::zero());
+        let withdrawable_staking_balance = self
+            .withdrawable_staking_balance(address, block_number)
+            .unwrap_or(U256::zero());
+        Ok(staking_balance - withdrawable_staking_balance)
     }
 
     fn deposit_list_length(&self, address: &Address) -> Result<usize> {
