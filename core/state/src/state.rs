@@ -352,27 +352,29 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
     fn withdrawable_staking_balance(
         &self, address: &Address, current_block_number: u64,
     ) -> Result<U256> {
-        let staking_balance =
-            self.staking_balance(address).unwrap_or(U256::zero());
-        let vote_stake_list =
-            self.get_vote_stake_list(address)?.as_ref().unwrap();
-        if vote_stake_list.is_empty() {
-            Ok(staking_balance)
-        } else {
-            // Find first index whose `unlock_block_number` is greater than
-            // timestamp and all entries before the index could be
-            // ignored.
-            let idx = vote_stake_list
-                .binary_search_by(|vote_info| {
-                    vote_info
-                        .unlock_block_number
-                        .cmp(&(current_block_number + 1))
-                })
-                .unwrap_or_else(|x| x);
-            if idx == vote_stake_list.len() {
-                Ok(staking_balance)
-            } else {
-                Ok(staking_balance - vote_stake_list[idx].amount)
+        let staking_balance = self.staking_balance(address)?;
+        match **self.get_vote_stake_list(address)?.as_ref() {
+            None => Ok(staking_balance),
+            Some(vote_stake_list) => {
+                if vote_stake_list.is_empty() {
+                    Ok(staking_balance)
+                } else {
+                    // Find first index whose `unlock_block_number` is greater
+                    // than timestamp and all entries before
+                    // the index could be ignored.
+                    let idx = vote_stake_list
+                        .binary_search_by(|vote_info| {
+                            vote_info
+                                .unlock_block_number
+                                .cmp(&(current_block_number + 1))
+                        })
+                        .unwrap_or_else(|x| x);
+                    if idx == vote_stake_list.len() {
+                        Ok(staking_balance)
+                    } else {
+                        Ok(staking_balance - vote_stake_list[idx].amount)
+                    }
+                }
             }
         }
     }
@@ -380,11 +382,9 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
     fn locked_staking_balance_at_block_number(
         &self, address: &Address, block_number: u64,
     ) -> Result<U256> {
-        let staking_balance =
-            self.staking_balance(address).unwrap_or(U256::zero());
-        let withdrawable_staking_balance = self
-            .withdrawable_staking_balance(address, block_number)
-            .unwrap_or(U256::zero());
+        let staking_balance = self.staking_balance(address)?;
+        let withdrawable_staking_balance =
+            self.withdrawable_staking_balance(address, block_number)?;
         Ok(staking_balance - withdrawable_staking_balance)
     }
 
@@ -407,13 +407,29 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
     }
 
     fn inc_nonce(
-        &mut self, _address: &Address, _account_start_nonce: &U256,
+        &mut self, address: &Address, account_start_nonce: &U256,
     ) -> Result<()> {
-        unimplemented!()
+        self.modify_and_update_account(address, None)?
+            .as_mut()
+            .map_or_else(
+                || Err(ErrorKind::IncompleteDatabase(*address).into()),
+                |value| {
+                    value.nonce = *account_start_nonce + U256::from(1u8);
+                    Ok(())
+                },
+            )
     }
 
-    fn set_nonce(&mut self, _address: &Address, _nonce: &U256) -> Result<()> {
-        unimplemented!()
+    fn set_nonce(&mut self, address: &Address, nonce: &U256) -> Result<()> {
+        self.modify_and_update_account(address, None)?
+            .as_mut()
+            .map_or_else(
+                || Err(ErrorKind::IncompleteDatabase(*address).into()),
+                |value| {
+                    value.nonce = *nonce;
+                    Ok(())
+                },
+            )
     }
 
     fn sub_balance(
@@ -448,7 +464,7 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
 
     fn transfer_balance(
         &mut self, _from: &Address, _to: &Address, _by: &U256,
-        _cleanup_mode: CleanupMode, _account_start_nonce: U256,
+        _cleanup_mode: CleanupMode, _account_stfart_nonce: U256,
     ) -> Result<()>
     {
         unimplemented!()
@@ -467,17 +483,89 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
     }
 
     fn vote_lock(
-        &mut self, _address: &Address, _amount: &U256,
-        _unlock_block_number: u64,
-    ) -> Result<()>
-    {
-        unimplemented!()
+        &mut self, address: &Address, amount: &U256, unlock_block_number: u64,
+    ) -> Result<()> {
+        let staking_balance = self.staking_balance(address)?;
+        if *amount > staking_balance {
+            ()
+        }
+        let mut updated = false;
+        let mut updated_index = 0;
+        self.modify_and_update_vote_stake_list(address, None)?
+            .as_mut()
+            .map_or_else(
+                || Ok(()),
+                |vote_stake_list| {
+                    match vote_stake_list.binary_search_by(|vote_info| {
+                        vote_info.unlock_block_number.cmp(&unlock_block_number)
+                    }) {
+                        Ok(index) => {
+                            if *amount > vote_stake_list[index].amount {
+                                vote_stake_list[index].amount = *amount;
+                                updated = true;
+                                updated_index = index;
+                            }
+                        }
+                        Err(index) => {
+                            if index >= vote_stake_list.len()
+                                || vote_stake_list[index].amount < *amount
+                            {
+                                vote_stake_list.insert(
+                                    index,
+                                    VoteStakeInfo {
+                                        amount: *amount,
+                                        unlock_block_number,
+                                    },
+                                );
+                                updated = true;
+                                updated_index = index;
+                            }
+                        }
+                    }
+                    if updated {
+                        let rest = vote_stake_list.split_off(updated_index);
+                        while !vote_stake_list.is_empty()
+                            && vote_stake_list.last().unwrap().amount
+                                <= rest[0].amount
+                        {
+                            vote_stake_list.pop();
+                        }
+                        vote_stake_list.extend_from_slice(&rest);
+                    }
+                    Ok(())
+                },
+            )
     }
 
     fn remove_expired_vote_stake_info(
-        &mut self, _address: &Address, _current_block_number: u64,
+        &mut self, address: &Address, current_block_number: u64,
     ) -> Result<()> {
-        unimplemented!()
+        self.modify_and_update_vote_stake_list(address, None)?
+            .as_mut()
+            .map_or_else(
+                || Ok(()),
+                |vote_stake_list| {
+                    if !vote_stake_list.is_empty()
+                        && vote_stake_list[0].unlock_block_number
+                            <= current_block_number
+                    {
+                        // Find first index whose `unlock_block_number` is
+                        // greater than timestamp and
+                        // all entries before the index could be
+                        // removed.
+                        let idx = vote_stake_list
+                            .binary_search_by(|vote_info| {
+                                vote_info
+                                    .unlock_block_number
+                                    .cmp(&(current_block_number + 1))
+                            })
+                            .unwrap_or_else(|x| x);
+                        *vote_stake_list =
+                            VoteStakeList(vote_stake_list.split_off(idx));
+                    }
+                    Ok(())
+                },
+            )
     }
 
     fn total_issued_tokens(&self) -> &U256 { unimplemented!() }
@@ -561,6 +649,25 @@ impl<StateDbStorage: StorageStateTrait, Substate: SubstateMngTrait>
             debug_record,
         )
     }
+
+    fn modify_and_update_vote_stake_list<'a>(
+        &'a mut self, address: &Address,
+        debug_record: Option<&'a mut ComputeEpochDebugRecord>,
+    ) -> Result<
+        impl AsMut<
+            ModifyAndUpdate<
+                StateDbGeneric<StateDbStorage>,
+                /* TODO: Key, */ VoteStakeList,
+            >,
+        >,
+    >
+    {
+        self.cache.modify_and_update_vote_stake_list(
+            address,
+            &mut self.db,
+            debug_record,
+        )
+    }
 }
 
 use crate::{
@@ -581,6 +688,7 @@ use cfx_storage::{utils::guarded_value::NonCopy, StorageStateTrait};
 use cfx_types::{address_util::AddressUtil, Address, H256, U256};
 use keccak_hash::KECCAK_EMPTY;
 use primitives::{
-    CodeInfo, DepositList, EpochId, SponsorInfo, StorageLayout, VoteStakeList,
+    CodeInfo, DepositList, EpochId, SponsorInfo, StorageLayout, VoteStakeInfo,
+    VoteStakeList,
 };
 use std::{marker::PhantomData, sync::Arc};
